@@ -335,8 +335,8 @@ pub trait Inject: Send + Sync + 'static {}
 impl<T: Inject + ?Sized> Inject for Arc<T> {}
 
 /// Control when `Container` will call `Provide::provide`.
-#[derive(Clone, Debug)]
-pub enum Registration<T> {
+#[derive(Copy, Clone, Debug)]
+pub enum RegistrationKind {
     /// `Container` will construct a new instance of `T` for every invocation
     /// of `Container::resolve`.
     ///
@@ -367,7 +367,7 @@ pub enum Registration<T> {
     /// # }
     /// # the_test().unwrap()
     /// ```
-    Transient(T),
+    Transient,
     /// `Container` will construct a new instance of `T` for each scope
     /// container created through `Container::scoped`.
     ///
@@ -407,7 +407,7 @@ pub enum Registration<T> {
     /// # }
     /// # the_test().unwrap()
     /// ```
-    Scoped(T),
+    Scoped,
     /// The container will construct a single instance of `T` and reuse it
     /// throughout all scopes.
     ///
@@ -447,27 +447,18 @@ pub enum Registration<T> {
     /// # }
     /// # the_test().unwrap()
     /// ```
-    Singleton(T),
+    Singleton,
+}
+
+#[derive(Clone, Debug)]
+pub struct Registration<T> {
+    kind: RegistrationKind,
+    provider: T,
 }
 
 impl<T> Registration<T> {
-    fn as_ref(&self) -> Registration<&T> {
-        match self {
-            Registration::Transient(t) => Registration::Transient(t),
-            Registration::Scoped(t) => Registration::Scoped(t),
-            Registration::Singleton(t) => Registration::Singleton(t),
-        }
-    }
-
-    fn map<F, U>(self, mut func: F) -> Registration<U>
-    where
-        F: FnMut(T) -> U,
-    {
-        match self {
-            Registration::Transient(t) => Registration::Transient(func(t)),
-            Registration::Scoped(t) => Registration::Scoped(func(t)),
-            Registration::Singleton(t) => Registration::Singleton(func(t)),
-        }
+    pub fn new(kind: RegistrationKind, provider: T) -> Self {
+        Self { kind, provider }
     }
 }
 
@@ -499,7 +490,7 @@ impl Container {
         }
 
         // Try to find the provider
-        let any_provider = match self.provider_map.get(key) {
+        let registration = match self.provider_map.get(key) {
             Some(provider) => provider,
             None => {
                 // If the key is not found, then we might be a child container. If we have a
@@ -511,17 +502,18 @@ impl Container {
             }
         };
 
-        let provider = any_provider.as_ref().map(|p| {
-            p.downcast_ref::<Arc<dyn Provide<Output = T> + Send + Sync + 'static>>()
-                .map(Arc::clone)
-                .ok_or_else(|| Error::TypeMismatch(key.to_owned()))
-        });
+        let kind = registration.kind;
+        let provided = registration
+            .provider
+            .downcast_ref::<Arc<dyn Provide<Output = T> + Send + Sync + 'static>>()
+            .map(Arc::clone)
+            .ok_or_else(|| Error::TypeMismatch(key.to_owned()))?
+            .provide(self);
 
-        match provider {
-            Registration::Transient(p) => p?.provide(self),
-            Registration::Scoped(p) | Registration::Singleton(p) => {
-                let provided = p?.provide(self)?;
-                self.resolved_map.insert(key.to_owned(), Arc::new(provided));
+        match kind {
+            RegistrationKind::Transient => provided,
+            RegistrationKind::Scoped | RegistrationKind::Singleton => {
+                self.resolved_map.insert(key.to_owned(), Arc::new(provided?));
                 Ok(self.resolved_map[key]
                     .downcast_ref::<Arc<T>>()
                     .map(Arc::clone)
@@ -564,10 +556,14 @@ impl Scopable {
             provider_map: container
                 .provider_map
                 .iter()
-                .filter_map(|(k, v)| match v {
-                    Registration::Scoped(v) => {
-                        Some((k.clone(), Registration::Scoped(Arc::clone(v))))
-                    }
+                .filter_map(|(k, v)| match v.kind {
+                    kind @ RegistrationKind::Scoped => Some((
+                        k.clone(),
+                        Registration {
+                            kind,
+                            provider: Arc::clone(&v.provider),
+                        },
+                    )),
                     _ => None,
                 })
                 .collect(),
@@ -606,7 +602,10 @@ impl ContainerBuilder {
         T: Inject + ?Sized,
         P: Provide<Output = T> + Send + Sync + 'static,
     {
-        self.register_as(key, Registration::Transient(provider))
+        self.register_as(
+            key,
+            Registration::new(RegistrationKind::Transient, provider),
+        )
     }
 
     fn get_arc<P, T>(provider: P) -> Arc<dyn Provide<Output = T> + Send + Sync>
@@ -619,7 +618,7 @@ impl ContainerBuilder {
 
     /// Register a `Provider` for `T` with identifier `key`, while also specifying the resolution
     /// behavior.
-    pub fn register_as<K, P, T>(mut self, key: K, provider: Registration<P>) -> Self
+    pub fn register_as<K, P, T>(mut self, key: K, registration: Registration<P>) -> Self
     where
         K: Into<String>,
         T: Inject + ?Sized,
@@ -627,17 +626,21 @@ impl ContainerBuilder {
     {
         let key = key.into();
         #[cfg(feature = "debug")]
-        let mut deps = vec![];
+        let deps = registration.provider.dependencies();
         self.provider_map.insert(
             #[cfg(feature = "debug")]
-            { key.clone() },
+            {
+                key.clone()
+            },
             #[cfg(not(feature = "debug"))]
-            { key },
-            provider.map(|p| {
-                #[cfg(feature = "debug")]
-                { deps = p.dependencies(); }
-                Arc::new(Self::get_arc(p)) as Arc<dyn Any + Send + Sync>
-            }),
+            {
+                key
+            },
+            Registration {
+                kind: registration.kind,
+                provider: Arc::new(Self::get_arc(registration.provider))
+                    as Arc<dyn Any + Send + Sync>,
+            },
         );
         #[cfg(feature = "debug")]
         self.dependency_map.insert(key, deps);
@@ -747,16 +750,28 @@ mod test {
 #[macro_export]
 macro_rules! container {
     (@registration $provider:ident scoped) => {
-        ::coi::Registration::Scoped($provider)
+        $crate::Registration::new(
+            $crate::RegistrationKind::Scoped,
+            $provider
+        )
     };
     (@registration $provider:ident singleton) => {
-        ::coi::Registration::Singleton($provider)
+        $crate::Registration::new(
+            $crate::RegistrationKind::Singleton,
+            $provider
+        )
     };
     (@registration $provider:ident transient) => {
-        ::coi::Registration::Transient($provider)
+        $crate::Registration::new(
+            $crate::RegistrationKind::Transient,
+            $provider
+        )
     };
     (@registration $provider:ident) => {
-        ::coi::Registration::Transient($provider)
+        $crate::Registration::new(
+            $crate::RegistrationKind::Transient,
+            $provider
+        )
     };
     (@line $builder:ident $key:ident $provider:ident $($call:ident)?) => {
         $builder = $builder.register_as(stringify!($key), container!(@registration $provider $($call)?));
