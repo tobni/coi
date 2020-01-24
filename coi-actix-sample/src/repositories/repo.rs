@@ -1,7 +1,4 @@
-use crate::{
-    models::data::Data,
-    postgres::PostgresPool,
-};
+use crate::{models::data::Data, postgres::PostgresPool};
 use async_trait::async_trait;
 use coi::Inject;
 use mobc_postgres::tokio_postgres::NoTls;

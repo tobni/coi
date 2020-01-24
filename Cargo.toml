@@ -8,3 +8,8 @@ members = [
     "coi-test-debug",
     "coi-test-no-derive",
 ]
+
+[patch.crates-io]
+coi = { path = "coi" }
+coi-derive = { path = "coi-derive" }
+coi-actix-web = { path = "coi-actix-web" }

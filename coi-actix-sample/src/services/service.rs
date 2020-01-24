@@ -1,7 +1,4 @@
-use crate::{
-    models::data::Data,
-    repositories::repo::IRepository,
-};
+use crate::{models::data::Data, repositories::repo::IRepository};
 use async_trait::async_trait;
 use coi::Inject;
 use std::sync::Arc;
@@ -26,7 +23,10 @@ impl IService for Service {
     }
 
     async fn get_all(&self) -> Result<Vec<Data>, String> {
-        self.repository.get_all().await.map(|v| v.into_iter().map(Into::into).collect())
+        self.repository
+            .get_all()
+            .await
+            .map(|v| v.into_iter().map(Into::into).collect())
     }
 }
 
